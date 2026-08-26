@@ -4,6 +4,19 @@ static volatile sig_atomic_t g_running = 1;
 static int g_server_fd = -1;
 static int g_log_fd = -1;
 
+/* Helper function to format and write entry under lock */
+static void write_log_entry(const char *id, const char *data) {
+    if (g_log_fd < 0) return;
+    char ts[64], line[512];
+    get_timestamp_safe(ts, sizeof(ts));
+    format_log_safe(line, sizeof(line), ts, id, data);
+
+    if (lock_log(g_log_fd) == 0) {
+        safe_write(g_log_fd, line, strlen(line));
+        unlock_log(g_log_fd);
+    }
+}
+
 static void handle_sigint(int sig) {
     (void)sig;
     g_running = 0;
@@ -14,15 +27,43 @@ static void handle_sigint(int sig) {
     }
 }
 
+/* Worker thread handling a producer connection */
 static void *worker_thread(void *arg) {
     int cfd = *(int *)arg;
     free(arg);
-    char buf[BUFFER_SIZE];
+
+    char sender_id[128] = "UNKNOWN";
+    char buf[BUFFER_SIZE], line[BUFFER_SIZE];
+    size_t line_len = 0;
 
     while (g_running) {
         ssize_t n = safe_read(cfd, buf, sizeof(buf) - 1);
-        if (n <= 0) break;
-        if (g_log_fd >= 0) safe_write(g_log_fd, buf, (size_t)n);
+        if (n <= 0) {
+            if (n == 0 || errno == EPIPE || errno == ECONNRESET) {
+                write_log_entry(sender_id, "DISCONNECT");
+            }
+            break;
+        }
+
+        for (ssize_t i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c == '\n' || c == '\r') {
+                if (line_len > 0) {
+                    line[line_len] = '\0';
+                    char id[128], val[128];
+                    if (sscanf(line, "%127s %127s", id, val) == 2) {
+                        strncpy(sender_id, id, sizeof(sender_id) - 1);
+                        write_log_entry(id, val);
+                    } else if (sscanf(line, "%127s", id) == 1) {
+                        strncpy(sender_id, id, sizeof(sender_id) - 1);
+                        write_log_entry(id, "N/A");
+                    }
+                    line_len = 0;
+                }
+            } else if (line_len + 1 < sizeof(line)) {
+                line[line_len++] = c;
+            }
+        }
     }
 
     safe_close(cfd);
