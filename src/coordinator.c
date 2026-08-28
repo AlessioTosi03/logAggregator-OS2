@@ -2,12 +2,17 @@
 
 /* Global server state and open file descriptors */
 static volatile sig_atomic_t g_running = 1; /* Flag: 1 while running, 0 when user presses Ctrl+C */
-static int g_server_fd = -1;                /* Server network socket listening for connections */
 static int g_log_fd = -1;                   /* File descriptor for writing logs */
+static int g_server_fd = -1;                /* Server network socket listening for connections */
 static char g_log_file[256] = LOG_FILE;     /* Active log filename */
 static off_t g_max_size = MAX_LOG_SIZE;     /* File size limit before rotating */
 static int g_interval = ALARM_INTERVAL;     /* Timer interval for rotation check */
 static int g_port = PORT;                   /* Port number to listen on */
+
+/* Thread synchronization: tracks active worker threads for clean shutdown */
+static pthread_mutex_t g_active_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_active_cond = PTHREAD_COND_INITIALIZER;
+static int g_active_count = 0;              /* Counter of currently running client threads */
 
 /* Helper: formats a log message with timestamp and writes it under exclusive file lock */
 static void write_log_entry(const char *id, const char *data) {
@@ -40,7 +45,7 @@ static void handle_sigalrm(int sig) {
                     if (ts[i] == ' ' || ts[i] == ':') ts[i] = '_';
                 }
 
-                /* Rename current log to backup (e.g., aggregated.log.2026-08-27_21_24_00.bak) */
+                /* Rename current log to backup (e.g., aggregated.log.2026-08-28_18_42_00.bak) */
                 snprintf(archive, sizeof(archive), "%s.%s.bak", g_log_file, ts);
                 if (rename(g_log_file, archive) == 0) {
                     /* Create a fresh new log file and redirect g_log_fd to it */
@@ -63,7 +68,7 @@ static void handle_sigpipe(int sig) {
     write_log_entry("SIGPIPE_EVENT", "DISCONNECT");
 }
 
-/* SIGINT: Signal handler for Ctrl+C to initiate graceful shutdown */
+/* SIGINT: Controlled graceful termination on Ctrl+C */
 static void handle_sigint(int sig) {
     (void)sig;
     g_running = 0; /* Tell server loop to stop accepting */
@@ -139,6 +144,13 @@ static void *worker_thread(void *arg) {
     }
 
     safe_close(cfd); /* Close client socket */
+
+    /* Decrement active thread count and signal coordinator if all threads finished */
+    pthread_mutex_lock(&g_active_mutex);
+    g_active_count--;
+    if (g_active_count == 0) pthread_cond_signal(&g_active_cond);
+    pthread_mutex_unlock(&g_active_mutex);
+
     return NULL;
 }
 
@@ -169,6 +181,9 @@ int main(int argc, char *argv[]) {
     /* Allow restarting server immediately without "port already in use" errors */
     int reuse = 1;
     setsockopt(g_server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+    setsockopt(g_server_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
 
     /* Configure server IP address and port */
     struct sockaddr_in addr = {
@@ -178,8 +193,11 @@ int main(int argc, char *argv[]) {
     };
 
     /* Bind socket to port and start listening for connections */
-    if (bind(g_server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(g_server_fd, 128) < 0) {
-        perror("bind/listen"); exit(EXIT_FAILURE);
+    if (bind(g_server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); exit(EXIT_FAILURE);
+    }
+    if (listen(g_server_fd, 128) < 0) {
+        perror("listen"); exit(EXIT_FAILURE);
     }
 
     /* Start the periodic alarm timer for log rotation */
@@ -203,18 +221,30 @@ int main(int argc, char *argv[]) {
         if (!pfd) { safe_close(client_fd); continue; }
         *pfd = client_fd;
 
-        /* Spawn a dedicated thread for each connected producer */
+        /* Increment active thread counter before spawning */
         pthread_t tid;
+        pthread_mutex_lock(&g_active_mutex);
+        g_active_count++;
+        pthread_mutex_unlock(&g_active_mutex);
+
+        /* Spawn worker thread */
         if (pthread_create(&tid, NULL, worker_thread, pfd) != 0) {
-            safe_close(client_fd);
-            free(pfd);
+            safe_close(client_fd); free(pfd);
+            pthread_mutex_lock(&g_active_mutex);
+            g_active_count--;
+            pthread_mutex_unlock(&g_active_mutex);
         } else {
-            pthread_detach(tid); /* Let thread clean up automatically when done */
+            pthread_detach(tid); /* Prevent zombie threads */
         }
     }
 
     printf("[COORDINATOR] Stopping server...\n");
     alarm(0); /* Disable periodic alarm timer */
+
+    /* Wait for active worker threads to finish and flush before closing log */
+    pthread_mutex_lock(&g_active_mutex);
+    while (g_active_count > 0) pthread_cond_wait(&g_active_cond, &g_active_mutex);
+    pthread_mutex_unlock(&g_active_mutex);
 
     /* Cleanup server resources upon exit */
     if (g_server_fd >= 0) safe_close(g_server_fd);
@@ -222,6 +252,7 @@ int main(int argc, char *argv[]) {
         lock_log(g_log_fd);
         safe_close(g_log_fd);
     }
-    printf("[COORDINATOR] Shutdown completed.\n");
+
+    printf("[COORDINATOR] Graceful shutdown completed.\n");
     return 0;
 }
