@@ -14,6 +14,11 @@ static pthread_mutex_t g_active_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_active_cond = PTHREAD_COND_INITIALIZER;
 static int g_active_count = 0;              /* Counter of currently running client threads */
 
+/* Per-thread state used by the SIGPIPE handler. The handler runs in the same
+ * thread that performed the failing write, so thread-local storage is race-free. */
+static __thread char t_sender[128] = "UNKNOWN";           /* Sender ID of this connection */
+static __thread volatile sig_atomic_t t_disconnect_logged = 0; /* Handler already logged? */
+
 /* Helper: formats a log message with timestamp and writes it under exclusive file lock */
 static void write_log_entry(const char *id, const char *data) {
     if (g_log_fd < 0) return;
@@ -62,10 +67,11 @@ static void handle_sigalrm(int sig) {
     alarm(g_interval); /* Rearm the alarm timer for next check */
 }
 
-/* SIGPIPE: Handles sudden client socket disconnection during write */
+/* SIGPIPE: Raised when we write to a client socket whose peer already closed */
 static void handle_sigpipe(int sig) {
     (void)sig;
-    write_log_entry("SIGPIPE_EVENT", "DISCONNECT");
+    t_disconnect_logged = 1;
+    write_log_entry(t_sender, "DISCONNECT");
 }
 
 /* SIGINT: Controlled graceful termination on Ctrl+C */
@@ -105,7 +111,6 @@ static void *worker_thread(void *arg) {
     int cfd = *(int *)arg;
     free(arg); /* Free heap memory allocated for socket descriptor */
 
-    char sender_id[128] = "UNKNOWN";
     char buf[BUFFER_SIZE], line[BUFFER_SIZE];
     size_t line_len = 0;
 
@@ -113,10 +118,12 @@ static void *worker_thread(void *arg) {
     while (g_running) {
         ssize_t n = safe_read(cfd, buf, sizeof(buf) - 1);
         if (n <= 0) {
-            /* If connection closed or broken, record disconnect event in log */
-            if (n == 0 || errno == EPIPE || errno == ECONNRESET) {
-                write_log_entry(sender_id, "DISCONNECT");
+            /* Connection closed or broken: log DISCONNECT, unless the SIGPIPE
+             * handler already logged it when our ACK write hit a closed socket. */
+            if ((n == 0 || errno == ECONNRESET) && !t_disconnect_logged) {
+                write_log_entry(t_sender, "DISCONNECT");
             }
+            t_disconnect_logged = 0;
             break;
         }
 
@@ -129,12 +136,15 @@ static void *worker_thread(void *arg) {
                     char id[128], val[128];
                     /* Extract "SENDER_ID DATA" from the line */
                     if (sscanf(line, "%127s %127s", id, val) == 2) {
-                        strncpy(sender_id, id, sizeof(sender_id) - 1);
+                        strncpy(t_sender, id, sizeof(t_sender) - 1);
                         write_log_entry(id, val);
                     } else if (sscanf(line, "%127s", id) == 1) {
-                        strncpy(sender_id, id, sizeof(sender_id) - 1);
+                        strncpy(t_sender, id, sizeof(t_sender) - 1);
                         write_log_entry(id, "N/A");
                     }
+                    /* Acknowledge the line: if the client already hung up, this
+                     * write raises SIGPIPE, which handle_sigpipe() logs. */
+                    safe_write(cfd, "ACK\n", 4);
                     line_len = 0; /* Reset line buffer for next message */
                 }
             } else if (line_len + 1 < sizeof(line)) {
