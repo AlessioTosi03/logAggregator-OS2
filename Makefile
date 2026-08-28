@@ -7,7 +7,7 @@ INC_DIR = include
 TEST_DIR = tests
 BIN_DIR = bin
 
-TARGETS = $(BIN_DIR)/coordinator $(BIN_DIR)/producer
+TARGETS = $(BIN_DIR)/coordinator $(BIN_DIR)/producer $(BIN_DIR)/test_suite
 
 all: $(BIN_DIR) $(TARGETS)
 
@@ -23,7 +23,13 @@ $(BIN_DIR)/coordinator: $(SRC_DIR)/coordinator.c $(BIN_DIR)/common.o
 $(BIN_DIR)/producer: $(SRC_DIR)/producer.c $(BIN_DIR)/common.o
 	$(CC) $(CFLAGS) $(SRC_DIR)/producer.c $(BIN_DIR)/common.o -o $(BIN_DIR)/producer $(LDFLAGS)
 
+$(BIN_DIR)/test_suite: $(TEST_DIR)/test_suite.c $(BIN_DIR)/common.o
+	$(CC) $(CFLAGS) $(TEST_DIR)/test_suite.c $(BIN_DIR)/common.o -o $(BIN_DIR)/test_suite $(LDFLAGS)
+
 clean:
 	rm -rf $(BIN_DIR) *.log *.bak
 
-.PHONY: all clean
+test: all
+	./$(BIN_DIR)/test_suite
+
+.PHONY: all clean test
