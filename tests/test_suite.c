@@ -35,6 +35,19 @@ static int file_contains(const char *path, const char *needle) {
     return found;
 }
 
+/* Helper: conta quante righe del file contengono la sottostringa */
+static int count_lines_with(const char *path, const char *needle) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[512];
+    int n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, needle)) n++;
+    }
+    fclose(f);
+    return n;
+}
+
 /* Helper: conta i file che corrispondono a un pattern glob */
 static int count_glob(const char *pattern) {
     glob_t g;
@@ -116,9 +129,18 @@ int main(void) {
     pid_t p4 = avvia_coordinatore("8904", "test4.log", "10000", "10");
     system("./bin/producer -p 8904 -i PROD_ABRUPT -d 555 -c > /dev/null 2>&1");
     usleep(300000); /* Attendi che il coordinatore registri la disconnessione */
+    int prima = count_lines_with("test4.log", "DISCONNECT");
+    CHECK(prima >= 1, "Disconnessione produttore registrata nel log");
+
+    /* Invia SIGPIPE direttamente al coordinatore: solo l'handler puo' scrivere
+     * questa voce, quindi l'incremento prova che l'handler e' stato eseguito. */
+    kill(p4, SIGPIPE);
+    usleep(300000);
+    int dopo = count_lines_with("test4.log", "DISCONNECT");
+    CHECK(dopo == prima + 1, "Handler SIGPIPE ha scritto la voce DISCONNECT");
+
     kill(p4, SIGINT);
     waitpid(p4, NULL, 0);
-    CHECK(file_contains("test4.log", "DISCONNECT"), "Evento DISCONNECT registrato nel log");
 
     /* 5. STRESS TEST CONCORRENTE: SIGALRM A RAFFICA DURANTE SCRITTURE MASSIVE */
     printf("\n--- 5. Stress Test: Concorrenza Massiva + SIGALRM a Raffica ---\n");
